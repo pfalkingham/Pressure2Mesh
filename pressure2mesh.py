@@ -2,8 +2,8 @@
 Blender script: build a pressure mesh from a delimited text file.
 
 Usage:
-1. Edit FILE_PATH and DELIMITER below.
-2. Run this script from Blender's Text Editor.
+1. Run this script from Blender's Text Editor.
+2. Pick a source file when the file dialog opens.
 
 Each pressure value maps to one vertex.
 Z displacement is negative: z = -(pressure / PRESSURE_DIVISOR).
@@ -13,6 +13,7 @@ import csv
 import os
 import re
 import math
+import traceback
 
 import bpy
 from mathutils import Vector
@@ -22,8 +23,8 @@ from mathutils import Vector
 # Configuration (edit these values)
 # -----------------------------------------------------------------------------
 
-# Hardcoded input path as requested.
-FILE_PATH = r"C:\Users\pfalk\Desktop\Pressure\CCH_24 - 1-13-2014 - Entire Plate Roll Off.xls"
+# Optional initial location for the file picker.
+DEFAULT_FILE_PATH = r"C:\Users\pfalk\Desktop\Pressure\CCH_24 - 1-13-2014 - Entire Plate Roll Off.xls"
 
 # Delimiter in your data file.
 # Use "," for CSV or "\t" for tab-delimited text.
@@ -45,6 +46,10 @@ CM_TO_BLENDER_UNITS = 0.01
 
 # Mesh object name created/replaced by this script.
 OBJECT_NAME = "PressureMesh"
+PEAK_OBJECT_NAME = "PressureMesh_Peak"
+
+# Gap between animated and peak meshes, in cell widths.
+PEAK_MESH_GAP_CELLS = 4.0
 
 # Optional source sampling frequency from the roll-off export header.
 # Kept for reference; the animation uses a 1:1 source-frame timeline by default.
@@ -63,38 +68,78 @@ def parse_numeric_row(line):
 	return [float(token) for token in FLOAT_PATTERN.findall(line)]
 
 
+def extract_rectangular_grid_from_lines(path, header_rows_to_skip=0):
+	"""Best-effort numeric grid extraction for headerless exports."""
+	numeric_rows = []
+	with open(path, "r", encoding="utf-8-sig") as fh:
+		for line_idx, line in enumerate(fh, start=1):
+			if line_idx <= header_rows_to_skip:
+				continue
+			values = parse_numeric_row(line)
+			if values:
+				numeric_rows.append((line_idx, values))
+
+	if not numeric_rows:
+		raise ValueError("No numeric pressure rows were found in the input file.")
+
+	max_cols = max(len(values) for _, values in numeric_rows)
+	candidates = [entry for entry in numeric_rows if len(entry[1]) == max_cols]
+	if not candidates:
+		raise ValueError("No rectangular numeric grid could be extracted from source.")
+
+	# Keep the longest contiguous run to avoid mixing metadata lines.
+	runs = []
+	current_run = [candidates[0]]
+	for prev, cur in zip(candidates, candidates[1:]):
+		if cur[0] == prev[0] + 1:
+			current_run.append(cur)
+		else:
+			runs.append(current_run)
+			current_run = [cur]
+	runs.append(current_run)
+
+	best_run = max(runs, key=len)
+	grid = [values for _, values in best_run]
+
+	if not grid:
+		raise ValueError("No contiguous numeric grid found.")
+
+	return grid
+
+
 def load_pressure_grid(path, delimiter, header_rows_to_skip=0):
 	"""Read a rectangular numeric grid from a delimited text file."""
 	if not os.path.exists(path):
 		raise FileNotFoundError(f"Input file not found: {path}")
 
 	grid = []
-	with open(path, "r", newline="", encoding="utf-8-sig") as fh:
-		reader = csv.reader(fh, delimiter=delimiter)
-		for row_idx, row in enumerate(reader):
-			if row_idx < header_rows_to_skip:
-				continue
+	try:
+		with open(path, "r", newline="", encoding="utf-8-sig") as fh:
+			reader = csv.reader(fh, delimiter=delimiter)
+			for row_idx, row in enumerate(reader):
+				if row_idx < header_rows_to_skip:
+					continue
 
-			# Drop trailing empty fields from accidental delimiter-at-EOL cases.
-			while row and row[-1] == "":
-				row.pop()
+				# Drop trailing empty fields from accidental delimiter-at-EOL cases.
+				while row and row[-1] == "":
+					row.pop()
 
-			if not row:
-				continue
+				if not row:
+					continue
 
-			numeric_row = []
-			try:
+				numeric_row = []
 				for token in row:
 					token = token.strip()
 					if token == "":
 						raise ValueError("empty value inside data row")
 					numeric_row.append(float(token))
-			except ValueError as exc:
-				raise ValueError(
-					f"Non-numeric value at source row {row_idx + 1}: {row}"
-				) from exc
 
-			grid.append(numeric_row)
+				grid.append(numeric_row)
+	except ValueError:
+		grid = extract_rectangular_grid_from_lines(
+			path=path,
+			header_rows_to_skip=header_rows_to_skip,
+		)
 
 	if not grid:
 		raise ValueError("No numeric pressure rows were found in the input file.")
@@ -211,7 +256,7 @@ def delete_existing_object(name):
 		bpy.data.meshes.remove(mesh_data)
 
 
-def build_pressure_mesh(grid, cell_size_x_bu, cell_size_y_bu, pressure_divisor):
+def build_pressure_mesh(grid, cell_size_x_bu, cell_size_y_bu, pressure_divisor, object_name=OBJECT_NAME):
 	"""Create and link a new pressure mesh object from grid data."""
 	if pressure_divisor == 0:
 		raise ValueError("PRESSURE_DIVISOR cannot be 0.")
@@ -240,13 +285,35 @@ def build_pressure_mesh(grid, cell_size_x_bu, cell_size_y_bu, pressure_divisor):
 			v3 = v0 + cols
 			faces.append((v0, v1, v2, v3))
 
-	mesh = bpy.data.meshes.new(f"{OBJECT_NAME}_Mesh")
+	mesh = bpy.data.meshes.new(f"{object_name}_Mesh")
 	mesh.from_pydata(verts, [], faces)
 	mesh.update()
 
-	obj = bpy.data.objects.new(OBJECT_NAME, mesh)
+	obj = bpy.data.objects.new(object_name, mesh)
 	bpy.context.scene.collection.objects.link(obj)
 	return obj
+
+
+def compute_peak_pressure_grid(frames):
+	"""Compute per-cell maximum pressure across all frames."""
+	if not frames:
+		raise ValueError("No frames available for peak-pressure computation.")
+
+	rows = len(frames[0])
+	cols = len(frames[0][0])
+	peak_grid = [[-math.inf for _ in range(cols)] for _ in range(rows)]
+
+	for frame_idx, frame in enumerate(frames):
+		if len(frame) != rows or len(frame[0]) != cols:
+			raise ValueError(
+				f"Frame size mismatch at index {frame_idx}: "
+				f"got {len(frame)}x{len(frame[0])}, expected {rows}x{cols}."
+			)
+		for r in range(rows):
+			for c in range(cols):
+				peak_grid[r][c] = max(peak_grid[r][c], frame[r][c])
+
+	return peak_grid
 
 
 def apply_grid_to_shape_key(shape_key, grid, pressure_divisor):
@@ -309,13 +376,19 @@ def create_rolloff_shape_key_animation(obj, frames, pressure_divisor):
 	scene.frame_set(previous_frame)
 
 
-def main():
+def process_selected_file(selected_path):
+	"""Load source data and create animated + peak meshes."""
+	if not selected_path:
+		raise RuntimeError("File selection canceled by user.")
+
+	print(f"Selected file: {selected_path}")
 	frames, timestamps_ms, is_rolloff = load_pressure_data(
-		path=FILE_PATH,
+		path=selected_path,
 		delimiter=DELIMITER,
 		header_rows_to_skip=HEADER_ROWS_TO_SKIP,
 	)
 	grid = frames[0]
+	peak_grid = compute_peak_pressure_grid(frames)
 
 	cell_size_x_bu = CELL_SIZE_X_CM * CM_TO_BLENDER_UNITS
 	cell_size_y_bu = CELL_SIZE_Y_CM * CM_TO_BLENDER_UNITS
@@ -329,7 +402,21 @@ def main():
 		cell_size_x_bu=cell_size_x_bu,
 		cell_size_y_bu=cell_size_y_bu,
 		pressure_divisor=PRESSURE_DIVISOR,
+		object_name=OBJECT_NAME,
 	)
+
+	delete_existing_object(PEAK_OBJECT_NAME)
+	peak_obj = build_pressure_mesh(
+		grid=peak_grid,
+		cell_size_x_bu=cell_size_x_bu,
+		cell_size_y_bu=cell_size_y_bu,
+		pressure_divisor=PRESSURE_DIVISOR,
+		object_name=PEAK_OBJECT_NAME,
+	)
+
+	grid_width_bu = (len(grid[0]) - 1) * cell_size_x_bu
+	peak_gap_bu = max(PEAK_MESH_GAP_CELLS * cell_size_x_bu, cell_size_x_bu)
+	peak_obj.location.x = grid_width_bu + peak_gap_bu
 
 	if is_rolloff and len(frames) > 1:
 		create_rolloff_shape_key_animation(
@@ -346,8 +433,12 @@ def main():
 	height_cm = rows * CELL_SIZE_Y_CM
 
 	print(f"Created object: {obj.name}")
+	print(f"Created peak object: {peak_obj.name}")
 	print(f"Grid: {rows} rows x {cols} cols")
 	print(f"Pressure range: {min_p} .. {max_p}")
+	peak_min_p = min(min(row) for row in peak_grid)
+	peak_max_p = max(max(row) for row in peak_grid)
+	print(f"Peak pressure range: {peak_min_p} .. {peak_max_p}")
 	print(f"Frames loaded: {len(frames)}")
 	if is_rolloff and len(frames) > 1:
 		t0 = timestamps_ms[0]
@@ -363,6 +454,56 @@ def main():
 	print(f"Cell size (cm): X={CELL_SIZE_X_CM}, Y={CELL_SIZE_Y_CM}")
 	print(f"Footprint (cm): width={width_cm}, height={height_cm}")
 	print(f"Z mapping: z = -(pressure / {PRESSURE_DIVISOR})")
+
+
+class PRESSURE_OT_pick_file(bpy.types.Operator):
+	"""Select a pressure export file and build meshes."""
+	bl_idname = "pressure.pick_file"
+	bl_label = "Pick Pressure File"
+	bl_options = {'REGISTER'}
+
+	filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+	filter_glob: bpy.props.StringProperty(
+		default="*.xls;*.csv;*.tsv;*.txt",
+		options={'HIDDEN'},
+	)
+
+	def execute(self, context):
+		try:
+			process_selected_file(self.filepath)
+		except Exception as exc:
+			print("pressure2mesh failed:")
+			traceback.print_exc()
+			self.report({'ERROR'}, str(exc))
+			return {'CANCELLED'}
+		self.report({'INFO'}, "Pressure mesh generation completed")
+		return {'FINISHED'}
+
+	def invoke(self, context, event):
+		if DEFAULT_FILE_PATH and os.path.exists(DEFAULT_FILE_PATH):
+			self.filepath = DEFAULT_FILE_PATH
+		context.window_manager.fileselect_add(self)
+		return {'RUNNING_MODAL'}
+
+
+def register_operator():
+	"""Register or refresh the file-picker operator."""
+	try:
+		bpy.utils.unregister_class(PRESSURE_OT_pick_file)
+	except Exception:
+		pass
+	bpy.utils.register_class(PRESSURE_OT_pick_file)
+
+
+def main():
+	if bpy.app.background:
+		raise RuntimeError("Cannot open file picker in background mode. Run this in Blender UI.")
+
+	register_operator()
+	result = bpy.ops.pressure.pick_file('INVOKE_DEFAULT')
+	if 'RUNNING_MODAL' not in result:
+		raise RuntimeError(f"Failed to open Blender file picker: {result}")
+	print(f"File picker started: {result}")
 
 
 if __name__ == "__main__":
