@@ -189,6 +189,7 @@ def load_pressure_frames(path):
 	timestamps_ms = []
 	current_rows = None
 	current_frame_tag = None
+	expected_cols = None  # Track expected columns from first frame
 
 	for line_idx, line in enumerate(lines, start=1):
 		header = FRAME_HEADER_PATTERN.match(line)
@@ -208,6 +209,11 @@ def load_pressure_frames(path):
 
 		row_values = parse_numeric_row(line)
 		if row_values:
+			# Skip rows that don't match expected column count (e.g., trailing metadata)
+			if expected_cols is None:
+				expected_cols = len(row_values)
+			elif len(row_values) != expected_cols:
+				continue  # Likely metadata like "Rectangle width\n0"
 			current_rows.append(row_values)
 
 	if current_rows is not None:
